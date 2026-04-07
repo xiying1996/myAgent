@@ -3,11 +3,16 @@ single_agent_demo.py — 单 Agent 端到端演示
 
 演示场景：
   1. 创建 3 步 Plan（search → fetch → summarize）
-  2. 使用 MockLLM + MockToolRegistry 模拟执行
+  2. 默认使用 MockLLM，可通过环境变量切到 DeepSeek
   3. Step1 失败 → Fallback → 成功
   4. 输出完整执行日志
 
 运行:
+  python examples/single_agent_demo.py
+
+切换到 DeepSeek:
+  export MYAGENT_LLM_PROVIDER=deepseek
+  export DEEPSEEK_API_KEY=...
   python examples/single_agent_demo.py
 """
 
@@ -26,7 +31,8 @@ from core.state_machine import AgentState
 from events.event_queue import PriorityEventQueue
 from events.raw_event_bus import Dispatcher, RawEventBus
 
-from execution.llm_interface import MockLLM, MockToolRegistry
+from execution.llm_factory import create_llm_from_env
+from execution.llm_interface import MockToolRegistry
 from execution.step_runner import StepRunner
 from execution.tool_executor import ToolExecutor
 
@@ -52,10 +58,13 @@ def main():
     bus    = RawEventBus()
     Dispatcher(queue).attach(bus)
     sm     = StateManager()
-    llm    = MockLLM(simulate_delay_s=0.01)
+    llm    = create_llm_from_env(mock_delay_s=0.01)
     sr     = StepRunner(llm)
     dv     = DependencyValidator()
     pe     = PolicyEngine()
+
+    print(f"LLM Provider: {llm.provider_name} ({llm.model_name or 'n/a'})")
+    print("Note: 当前示例只有 fallback 耗尽时才会真正调用 LLM。")
 
     sched  = Scheduler(
         event_queue=queue,

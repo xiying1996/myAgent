@@ -317,6 +317,7 @@ class Scheduler:
             agent_id=action.agent_id,
             step_id=action.step_id,
             timeout_s=action.timeout_s,
+            metadata=dict(action.metadata),
         )
 
         # 状态转换：READY 路径是 RUNNING → WAITING，RETRYING 路径是 RETRYING → WAITING
@@ -329,7 +330,11 @@ class Scheduler:
             return
 
         if is_replan_dispatch:
-            self._publish_plan_snapshot(agent, step.step_id)
+            self._publish_plan_snapshot(
+                agent,
+                step.step_id,
+                resolved_action.metadata.get("replan_trace"),
+            )
 
         # 消耗 Step 计数
         agent.budget_usage.consume_step()
@@ -410,10 +415,24 @@ class Scheduler:
         completed_outputs = self._completed_outputs.setdefault(agent.agent_id, {})
         self._dep_validator.propagate_output(step_id, output, completed_outputs)
 
-    def _publish_plan_snapshot(self, agent: Agent, step_id: str) -> None:
+    def _publish_plan_snapshot(
+        self,
+        agent: Agent,
+        step_id: str,
+        replan_trace: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         把 replan 后的完整 Plan 快照记录为 PLAN_UPDATE 事件，供 Debug Replay 使用。
         """
+        plan_snapshot = serialize_plan_for_snapshot(agent.plan)
+        current_step = agent.current_step()
+        fallback_tools = []
+        if current_step is not None:
+            fallback_tools = [
+                fb["tool"]
+                for fb in plan_snapshot["steps"][plan_snapshot["current_index"]]["fallback_chain"]
+            ]
+
         event = Event.create(
             agent_id=agent.agent_id,
             event_type=EventType.PLAN_UPDATE,
@@ -421,14 +440,12 @@ class Scheduler:
                 "step_id": step_id,
                 "changes": {
                     "replanned_step": step_id,
-                    "fallback_tools": [
-                        fb["tool"]
-                        for fb in serialize_plan_for_snapshot(agent.plan)["steps"][agent.plan._current_index]["fallback_chain"]
-                    ] if agent.current_step() else [],
+                    "fallback_tools": fallback_tools,
                 },
-                "plan": serialize_plan_for_snapshot(agent.plan),
+                "plan": plan_snapshot,
                 "agent_state": agent.state.value,
                 "retry_mode": agent.retry_mode.value if agent.retry_mode else None,
+                "llm": dict(replan_trace or {}),
             },
             is_plan_snapshot=True,
         )

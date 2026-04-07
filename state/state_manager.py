@@ -141,7 +141,11 @@ class StateManager:
 
     def get_metrics(self, agent_id: str) -> Optional[AgentMetrics]:
         with self._lock:
-            return self._metrics.get(agent_id)
+            metrics = self._metrics.get(agent_id)
+            agent = self._agents.get(agent_id)
+            if metrics is not None and agent is not None:
+                self._sync_runtime_counters_locked(agent, metrics)
+            return metrics
 
     # ── 事件处理 ─────────────────────────────────────────────────────────
 
@@ -184,6 +188,7 @@ class StateManager:
         except InvalidTransitionError:
             raise
         finally:
+            self._sync_runtime_counters(agent)
             self._append_event_log(event)
 
         return agent
@@ -368,3 +373,15 @@ class StateManager:
                 # 重建 Event 对象（简化版本，直接用 dict 代替）
                 events.append(data)
         return events
+
+    def _sync_runtime_counters(self, agent: Agent) -> None:
+        with self._lock:
+            metrics = self._metrics.get(agent.agent_id)
+            if metrics is None:
+                return
+            self._sync_runtime_counters_locked(agent, metrics)
+
+    @staticmethod
+    def _sync_runtime_counters_locked(agent: Agent, metrics: AgentMetrics) -> None:
+        metrics.llm_call_count = agent.budget_usage.llm_call_count
+        metrics.replan_count = agent.budget_usage.replan_count

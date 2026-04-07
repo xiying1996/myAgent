@@ -381,7 +381,19 @@ class StepRunner:
             # 理论上不会到达（validate_replan 已保证 new_fallbacks 非空）
             raise ReplanFailedError(agent.agent_id, "Replan 后 Fallback Chain 仍为空（bug）")
 
-        return self._build_action(agent, new_fb.tool, new_fb.params)
+        return self._build_action(
+            agent,
+            new_fb.tool,
+            new_fb.params,
+            metadata={
+                "replan_trace": {
+                    "provider": self._llm.provider_name,
+                    "model": self._llm.model_name,
+                    "normalized_result": result.to_dict(include_raw_response=False),
+                    "raw_response": result.raw_response,
+                },
+            },
+        )
 
     # ── 内部：应用 Replan 到 Plan ─────────────────────────────────────────
 
@@ -426,6 +438,7 @@ class StepRunner:
         tool_name: str,
         params:    Dict[str, Any],
         timeout_s: float = 30.0,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Action:
         """
         构建 Action，注入 agent_id / step_id。
@@ -438,6 +451,7 @@ class StepRunner:
             agent_id     = agent.agent_id,
             step_id      = step.step_id,
             timeout_s    = timeout_s,
+            metadata     = dict(metadata or {}),
         )
 
 

@@ -2,11 +2,13 @@
 test_checkpoint.py — CheckpointManager + Replay 测试套件
 """
 
+import json
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -21,6 +23,7 @@ from events.event_queue import PriorityEventQueue
 from events.event_types import EventType
 from events.raw_event_bus import Dispatcher, RawEventBus
 from execution.llm_interface import MockLLM
+from execution.llm_deepseek import DeepSeekLLM
 from execution.step_runner import StepRunner
 from scheduler.policy_engine import PolicyEngine
 from scheduler.scheduler import Scheduler
@@ -225,3 +228,76 @@ class TestSchedulerCheckpointIntegration:
         snapshot = checkpoint_mgr.load_snapshot(agent.agent_id)
         assert snapshot is not None
         assert snapshot.last_event_id == evt.event_id
+
+    def test_scheduler_deepseek_replan_is_logged_and_replayable(self, tmp_path: Path):
+        queue = PriorityEventQueue()
+        bus = RawEventBus()
+        Dispatcher(queue).attach(bus)
+        state_mgr = StateManager(event_log_dir=str(tmp_path / "logs"))
+        checkpoint_mgr = CheckpointManager(snapshot_dir=str(tmp_path / "snaps"), snapshot_interval_steps=99)
+        llm = DeepSeekLLM(api_key="test-key")
+        sched = Scheduler(
+            event_queue=queue,
+            raw_event_bus=bus,
+            state_manager=state_mgr,
+            step_runner=StepRunner(llm),
+            dependency_validator=DependencyValidator(),
+            policy_engine=PolicyEngine(),
+            checkpoint_manager=checkpoint_mgr,
+        )
+        dummy = self._DummyExecutor()
+        sched.set_tool_executor(dummy)
+
+        plan = Plan.create([Step("s0", "primary", {"q": "x"})])
+        agent = Agent.create(plan=plan, agent_id="agent_deepseek_snapshot")
+        state_mgr.add_agent(agent)
+        sched._dep_validator.register_plan(plan)
+        sched._completed_outputs[agent.agent_id] = {}
+
+        agent.transition(AgentState.RUNNING, "start")
+        agent.transition(AgentState.WAITING, "submitted")
+        agent.transition(AgentState.RETRYING, "timeout", retry_mode=RetryMode.REPLAN_MODE)
+
+        raw_response = json.dumps({
+            "new_fallbacks": [
+                {"tool": "primary_v2", "params": {"q": "x", "mode": "replanned"}},
+            ],
+            "step_param_updates": {},
+            "reasoning": "switch to primary_v2",
+            "give_up": False,
+        })
+        mock_result = mock.MagicMock()
+        mock_result.choices = [mock.MagicMock()]
+        mock_result.choices[0].message.content = raw_response
+
+        with mock.patch.object(
+            llm._client.chat.completions,
+            "create",
+            return_value=mock_result,
+        ):
+            sched._dispatch_agent(agent)
+
+        evt = queue.get_nowait()
+        assert evt.event_type == EventType.PLAN_UPDATE
+        assert evt.payload["llm"]["provider"] == "deepseek"
+        assert evt.payload["llm"]["model"] == llm.model_name
+        assert evt.payload["llm"]["raw_response"] == raw_response
+        assert evt.payload["llm"]["normalized_result"]["new_fallbacks"][0]["tool"] == "primary_v2"
+        assert dummy.submitted[0].tool_name == "primary_v2"
+        assert dummy.submitted[0].params["mode"] == "replanned"
+
+        sched._process_event(evt)
+
+        snapshot = checkpoint_mgr.load_snapshot(agent.agent_id)
+        assert snapshot is not None
+        assert snapshot.last_event_id == evt.event_id
+
+        event_log = state_mgr.load_event_log(agent.agent_id)
+        replay = DebugReplayAgent(event_log=event_log)
+        replay_result = replay.replay_all()
+        assert replay_result["latest_llm_output"]["provider"] == "deepseek"
+        assert replay_result["latest_llm_output"]["raw_response"] == raw_response
+
+        recovered = RecoveryReplayAgent(snapshot=snapshot, event_log=event_log).recover()
+        assert recovered.current_step() is not None
+        assert recovered.current_step().fallback_chain[0].tool == "primary_v2"

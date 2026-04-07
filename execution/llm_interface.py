@@ -65,10 +65,28 @@ class ReplanResult:
     step_param_updates: Dict[str, Dict[str, Any]]  # sid → {param: value}
     reasoning:          str                         # LLM 的思考过程（供日志/debug）
     give_up:            bool = False                # True = LLM 放弃，建议直接 ERROR
+    raw_response:       Optional[str] = None        # Provider 原始输出（供 replay/audit）
 
     def is_empty(self) -> bool:
         """LLM 放弃时返回 True。"""
         return self.give_up or not self.new_fallbacks
+
+    def to_dict(self, *, include_raw_response: bool = True) -> Dict[str, Any]:
+        data = {
+            "new_fallbacks": [
+                {"tool": fb.tool, "params": dict(fb.params)}
+                for fb in self.new_fallbacks
+            ],
+            "step_param_updates": {
+                step_id: dict(params)
+                for step_id, params in self.step_param_updates.items()
+            },
+            "reasoning": self.reasoning,
+            "give_up": self.give_up,
+        }
+        if include_raw_response:
+            data["raw_response"] = self.raw_response
+        return data
 
 
 @dataclass
@@ -120,6 +138,16 @@ class LLMInterface(ABC):
     def call_count(self) -> int:
         """累计调用次数（供 Budget 记账）。"""
 
+    @property
+    def provider_name(self) -> str:
+        """Provider 名称，供日志 / snapshot / debug replay 使用。"""
+        return type(self).__name__
+
+    @property
+    def model_name(self) -> Optional[str]:
+        """模型名称；无明确模型概念时返回 None。"""
+        return None
+
     @abstractmethod
     def propose_replan(self, context: ReplanContext) -> ReplanResult:
         """
@@ -151,6 +179,14 @@ class MockLLM(LLMInterface):
     @property
     def call_count(self) -> int:
         return self._call_count
+
+    @property
+    def provider_name(self) -> str:
+        return "mock"
+
+    @property
+    def model_name(self) -> Optional[str]:
+        return "mock"
 
     def propose_replan(self, context: ReplanContext) -> ReplanResult:
         import time

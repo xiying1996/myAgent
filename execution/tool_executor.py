@@ -53,6 +53,7 @@ class Action:
     agent_id:  str
     step_id:   str
     timeout_s: float = 30.0
+    metadata:  Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

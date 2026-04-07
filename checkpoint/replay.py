@@ -151,6 +151,7 @@ class DebugReplayAgent:
         current_index = 0
         final_state = "UNKNOWN"
         latest_plan_snapshot = None
+        latest_llm_output = None
         plan_snapshot_count = 0
 
         for event_data in events:
@@ -159,6 +160,7 @@ class DebugReplayAgent:
 
             if event_data.get("is_plan_snapshot"):
                 latest_plan_snapshot = payload.get("plan")
+                latest_llm_output = payload.get("llm") or latest_llm_output
                 plan_snapshot_count += 1
                 if latest_plan_snapshot:
                     current_index = latest_plan_snapshot.get("current_index", current_index)
@@ -185,6 +187,7 @@ class DebugReplayAgent:
             "final_index": current_index,
             "plan_snapshot_count": plan_snapshot_count,
             "latest_plan_snapshot": latest_plan_snapshot,
+            "latest_llm_output": latest_llm_output,
             "final_state": final_state,
         }
 

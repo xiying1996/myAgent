@@ -37,7 +37,7 @@
     - [Event Log 结构](#event-log-结构)
     - [Replay 流程](#replay-流程)
     - [Snapshot 触发策略](#snapshot-触发策略)
-  - [9. 多 Agent 并行](#9-多-agent-并行)
+  - [9. 多 Agent 并行（设计目标，当前未完成）](#9-多-agent-并行设计目标当前未完成)
     - [Agent 间通信](#agent-间通信)
     - [跨 Agent 依赖声明](#跨-agent-依赖声明)
     - [并发安全](#并发安全)
@@ -49,8 +49,13 @@
     - [Phase 2：执行层（Day 4-7）](#phase-2执行层day-4-7)
     - [Phase 3：可观测 + 可恢复（Day 8-11）](#phase-3可观测--可恢复day-8-11)
     - [Phase 4：多 Agent + 收尾（Day 12-15）](#phase-4多-agent--收尾day-12-15)
-  - [13. 已知限制与后续规划](#13-已知限制与后续规划)
+  - [13. 当前状态、限制与后续规划](#13-当前状态限制与后续规划)
+    - [当前实现快照（2026-04）](#当前实现快照2026-04)
     - [当前版本限制（Python 原型）](#当前版本限制python-原型)
+    - [Treasure Map 对齐与下一阶段](#treasure-map-对齐与下一阶段)
+      - [当前定位](#当前定位)
+      - [下一阶段：补齐 Level 2（最优先）](#下一阶段补齐-level-2最优先)
+      - [再下一阶段：冲击 Level 3](#再下一阶段冲击-level-3)
     - [C++ 重构优先级（后续阶段）](#c-重构优先级后续阶段)
     - [接入真实 LLM 的注意点](#接入真实-llm-的注意点)
   - [快速开始](#快速开始)
@@ -203,9 +208,9 @@ StepRunner 负责决定 Agent 的下一步行动，是唯一与 LLM 交互的模
 | 范围 | 是否允许 LLM 修改 | 说明 |
 |------|:-----------------:|------|
 | 当前 Step 的 fallback chain | ✅ | 替换工具、调整参数 |
-| 后续未执行的 Step | ⚠️ 有限 | 仅 fallback 范围内微调，不全局重排 |
+| 后续未执行的 Step | ⚠️ 有限 | 仅允许参数微调（`step_param_updates`），不改 `tool_name / step_id / 顺序` |
 | 已成功执行的 Step | ❌ | 保持系统稳定性 |
-| 全 Plan 重新排序 | ❌ 受限 | 仅 Budget 允许时考虑 |
+| 全 Plan 重新排序 | ❌ | 当前实现明确禁止 |
 
 **局部 Replan 流程：**
 
@@ -219,9 +224,16 @@ Step 失败
   → 更新 Plan，继续执行
 ```
 
-**Mock LLM（测试用）：**
+**LLM Provider（当前实现）：**
 
-开发阶段 LLM 接口使用 Mock 实现，固定返回 fallback plan，不依赖真实 API。
+当前仓库同时支持：
+
+- `MockLLM`：开发 / 单测 / 离线演示
+- `DeepSeekLLM`：真实 API 接入，支持重试、结构化解析、`LLMCallError` 语义
+- `create_llm_from_env()`：运行时 provider 选择（`mock` / `deepseek`）
+
+成功的 Replan 会把 `provider / model / raw_response / normalized_result`
+一起写入 `PLAN_UPDATE` 事件，供 Checkpoint / Debug Replay 审计。
 
 ---
 
@@ -519,10 +531,16 @@ class EventRecord:
     event_type: EventType
     payload: Dict[str, Any]
     timestamp: float
+    priority: EventPriority
     is_plan_snapshot: bool = False  # LLM 输出是否被记录为 PlanSnapshot
 ```
 
-`PlanSnapshot` 是特殊的 Event，记录 LLM 的完整输出，用于 Debug Replay 的确定性重放。
+当 `is_plan_snapshot=True` 时：
+
+- `payload["plan"]` 保存 Replan 后的完整 Plan 快照
+- `payload["llm"]` 保存 `provider / model / raw_response / normalized_result`
+
+也就是说，当前实现已经能把真实 LLM 输出作为 `PlanSnapshot` 事件的一部分落到日志里。
 
 ### Replay 流程
 
@@ -532,8 +550,8 @@ class EventRecord:
 1. 读取 Event Log（从头或从指定 event_id）
 2. 清空 Agent 状态
 3. 按顺序重放事件
-4. 遇到 LLM 调用点 → 读取 PlanSnapshot，不重新调用 LLM
-5. 完整复现执行过程
+4. 遇到 LLM 调用点 → 读取 `PlanSnapshot.payload["llm"]`，不重新调用 LLM
+5. 输出确定性的状态摘要（`completed_steps / final_state / latest_plan_snapshot / latest_llm_output`）
 ```
 
 **Recovery Replay（从断点恢复）：**
@@ -553,7 +571,10 @@ class EventRecord:
 
 ---
 
-## 9. 多 Agent 并行
+## 9. 多 Agent 并行（设计目标，当前未完成）
+
+当前仓库的 `Scheduler` 可以同时持有多个 Agent，但还没有完成跨 Agent 数据依赖、
+通信协议和冲突解决。因此本节描述的是目标形态，而不是已经落地的 API。
 
 ### Agent 间通信
 
@@ -570,6 +591,7 @@ Agent A 完成 → 发送 TOOL_RESULT(agent_id=A, output={data})
 ### 跨 Agent 依赖声明
 
 ```python
+# 目标形态（当前代码尚未实现）
 Plan(
     agents=[
         AgentPlan(agent_id="A", steps=[...]),
@@ -581,13 +603,16 @@ Plan(
 
 ### 并发安全
 
-- 每个 Agent 有独立状态（无共享可变状态）
-- EventQueue 消费为串行（初版），避免竞态
-- StateManager 内部对单个 Agent 的更新串行化
+- 当前已具备：每个 Agent 独立状态、EventQueue 串行消费、StateManager 单 Agent 串行更新
+- 当前未具备：跨 Agent 共享状态、依赖唤醒协议、冲突解决策略
 
 ---
 
 ## 10. 数据结构定义
+
+以下为当前实现的近似结构，省略了部分 helper / 校验方法。
+需要注意：当前系统使用 `dependencies + input_bindings` 表达数据流，
+还没有独立的 `Edge` 类型。
 
 ```python
 from dataclasses import dataclass, field
@@ -608,13 +633,19 @@ class EventType(Enum):
     # HighPriority
     TIMEOUT          = "TIMEOUT"
     ERROR            = "ERROR"
+    TOOL_ERROR       = "TOOL_ERROR"
     SYSTEM_FALLBACK  = "SYSTEM_FALLBACK"
     BUDGET_EXCEEDED  = "BUDGET_EXCEEDED"
     # Normal
     TOOL_RESULT      = "TOOL_RESULT"
+    TOOL_FAILED      = "TOOL_FAILED"
     PLAN_UPDATE      = "PLAN_UPDATE"
     OBSERVATION      = "OBSERVATION"
     STATE_UPDATE     = "STATE_UPDATE"
+
+class EventPriority(Enum):
+    HIGH = "high"
+    NORMAL = "normal"
 
 class RetryMode(Enum):
     FALLBACK_MODE = "FALLBACK_MODE"
@@ -647,7 +678,7 @@ class Plan:
 @dataclass
 class ExecutionBudget:
     max_replans: int = 3
-    max_total_steps: int = 20
+    max_steps: int = 20
     max_llm_calls: int = 10
     wall_clock_timeout: float = 300.0
     allowed_tools: Optional[List[str]] = None
@@ -655,7 +686,7 @@ class ExecutionBudget:
 @dataclass
 class BudgetUsage:
     replan_count: int = 0
-    total_steps: int = 0
+    step_count: int = 0
     llm_call_count: int = 0
     start_time: float = 0.0
 
@@ -666,17 +697,17 @@ class Event:
     event_type: EventType
     payload: Dict[str, Any]
     timestamp: float
-    priority: str = "normal"           # "high" / "normal"
+    priority: EventPriority
+    is_plan_snapshot: bool = False
 
 @dataclass
 class Agent:
     agent_id: str
     plan: Plan
-    state: AgentState
     budget: ExecutionBudget
     budget_usage: BudgetUsage
-    history: List[Dict] = field(default_factory=list)
-    retry_mode: Optional[RetryMode] = None
+    state_machine: "StateMachine"
+    history: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = 0.0
 
 @dataclass
@@ -684,10 +715,17 @@ class Snapshot:
     snapshot_id: str
     agent_id: str
     timestamp: float
-    agent_state: AgentState
-    plan: Plan
-    budget_usage: BudgetUsage
-    history: List[Dict]
+    agent_state: str
+    retry_mode: Optional[str]
+    plan_id: str
+    plan: Dict[str, Any]
+    budget: Dict[str, Any]
+    current_index: int
+    completed_ids: List[str]
+    budget_usage: Dict[str, Any]
+    history: List[Dict[str, Any]]
+    state_history: List[Dict[str, Any]]
+    history_len: int
     last_event_id: str
 ```
 
@@ -740,52 +778,142 @@ CheckpointManager: 保存 DONE Snapshot
 
 ### Phase 1：数据模型 + 状态机（Day 1-3）
 
-| Day | 目标 | 关键产出 |
+状态：`已完成`
+
+| Day | 目标 | 当前结果 |
 |-----|------|---------|
-| 1 | 核心数据结构 | Step / Plan / Event / Agent / Budget dataclass |
-| 2 | 状态机实现 | StateMachine 类，合法转换表，非法转换异常 |
-| 3 | EventQueue | PriorityEventQueue，RawEventBus + Dispatcher |
+| 1 | 核心数据结构 | `Step / Plan / Event / Agent / Budget` 已落地 |
+| 2 | 状态机实现 | 严格 `StateMachine` 已落地，支持 `RetryMode` |
+| 3 | EventQueue | `PriorityEventQueue + RawEventBus + Dispatcher` 已落地 |
 
 ### Phase 2：执行层（Day 4-7）
 
-| Day | 目标 | 关键产出 |
+状态：`已完成`
+
+| Day | 目标 | 当前结果 |
 |-----|------|---------|
-| 4 | ToolExecutor | 异步执行，工具注册，超时检测 |
-| 5 | StepRunner + LLM Interface | Mock LLM，局部 Replan 范围校验 |
-| 6 | DependencyValidator + Scheduler | DAG 解析，循环检测，Scheduler 主循环 |
-| 7 | 单 Agent 端到端集成测试 | 4 种场景全部通过 |
+| 4 | ToolExecutor | 异步执行、超时检测、事件发布已落地 |
+| 5 | StepRunner + LLM Interface | `MockLLM + DeepSeekLLM + llm_factory` 已落地 |
+| 6 | DependencyValidator + Scheduler | DAG 校验、binding 解析、Scheduler 主循环已落地 |
+| 7 | 单 Agent 集成 | 单 Agent 主链路、fallback、replan、白名单路径已覆盖 |
 
 ### Phase 3：可观测 + 可恢复（Day 8-11）
 
-| Day | 目标 | 关键产出 |
+状态：`已完成`
+
+| Day | 目标 | 当前结果 |
 |-----|------|---------|
-| 8 | StateManager + Event Log | 全链路日志，JSON 持久化 |
-| 9 | PolicyEngine | Budget 检查，工具白名单 |
-| 10 | CheckpointManager + Snapshot | 定期快照，PlanSnapshot 事件 |
-| 11 | Replay（Debug + Recovery） | 两种 Replay 模式完整测试 |
+| 8 | StateManager + Event Log | JSONL Event Log、metrics、history 已落地 |
+| 9 | PolicyEngine | Budget 检查、工具白名单、Replan 前检查已落地 |
+| 10 | CheckpointManager + Snapshot | Snapshot、`PlanSnapshot` 事件已落地 |
+| 11 | Replay（Debug + Recovery） | Debug / Recovery Replay 已落地并有测试覆盖 |
 
 ### Phase 4：多 Agent + 收尾（Day 12-15）
 
-| Day | 目标 | 关键产出 |
+状态：`进行中`
+
+| Day | 目标 | 当前结果 |
 |-----|------|---------|
-| 12 | 多 Agent 调度 | 并行执行，跨 Agent 依赖 |
-| 13 | RETRYING 子状态细化 | fallback_mode / replan_mode 区分 |
-| 14 | 压力测试 | 10 Agent 并发，30% 随机失败，无死锁 |
-| 15 | 文档 + 接口整理 | 对外 API，README，C++ 重构接口准备 |
+| 12 | 多 Agent 调度 | `未完成`，当前仍以单 Agent 闭环为主 |
+| 13 | RETRYING 子状态细化 | `已完成`，`fallback_mode / replan_mode` 已落地 |
+| 14 | 压力测试 | `未完成`，尚无正式 stress harness |
+| 15 | 文档 + 接口整理 | `部分完成`，README 已更新，稳定对外 API 仍待整理 |
 
 ---
 
-## 13. 已知限制与后续规划
+## 13. 当前状态、限制与后续规划
+
+### 当前实现快照（2026-04）
+
+当前仓库已经形成一个可运行、可回放、可接真实 LLM 的单 Agent Runtime：
+
+- `Plan / Step` 已支持 DAG 校验、`dependencies`、`input_bindings`、`output_schema`
+- `StateMachine` 已严格落地，包含 `READY / RUNNING / WAITING / RETRYING / DONE / ERROR`
+- `RetryMode` 已落地，支持 `fallback_mode / replan_mode`
+- `ToolExecutor`、`Scheduler`、`PolicyEngine`、`StateManager` 已闭环
+- `StepRunner` 已支持局部 Replan，且真实接入了 `DeepSeekLLM`
+- `CheckpointManager + DebugReplay + RecoveryReplay` 已落地
+- 成功 Replan 会把 `provider / model / raw_response / normalized_result` 写入 `PlanSnapshot`
+- 当前回归结果：`pytest -q` → `173 passed, 1 skipped`
 
 ### 当前版本限制（Python 原型）
 
 | 限制 | 影响 | 规划解决方式 |
 |------|------|-------------|
-| EventQueue 串行消费 | 高并发吞吐受限 | Phase 2：Agent 粒度锁 + 并行消费 |
+| 还没有显式 `Edge` 类型 | 数据流仍由 `dependencies + input_bindings` 隐式表达 | 引入 `Edge + data_mapping`，把流程图升级为显式数据流图 |
+| Schema Contract 还不完整 | 目前只有 `output_schema`，没有正式 `input_schema` / tool contract registry | 补齐 `input_schema`、fallback schema 兼容校验、工具能力注册 |
+| Debug Replay 是确定性摘要，不是完整二次执行 | 能审计状态和 LLM 输出，但不能 1:1 重放工具副作用 | 持久化 resolved params、action metadata、tool outcome envelope |
+| 多 Agent 依赖未实现 | 还不能做 manager-workers / shared state / conflict resolution | 完成单 Agent Runtime 后再做跨 Agent 协议 |
+| EventQueue 串行消费 | 高并发吞吐受限 | Agent 粒度并发 / queue sharding |
 | Event Log 存 JSON 文件 | 大规模场景性能差 | 替换为 SQLite 或 protobuf |
-| LLM 接口为 Mock | 不测试真实 Replan 效果 | Day 5 后接入真实 LLM 进行集成测试 |
+| 对外 API 仍偏 demo 风格 | 真实集成时需要自己拼组件 | 整理稳定的 runtime config / factory / submit API |
 | 无分布式支持 | 单进程限制 | C++ 重构阶段引入分布式 Scheduler |
-| Snapshot 粒度固定 | 可能浪费存储 | 自适应 Snapshot 策略（基于 Step 重要性） |
+| 没有 memory / learning | 还没进入 Level 3 后半段和 Level 5 | 后续增加 working memory / episodic memory / trajectory learning |
+
+### Treasure Map 对齐与下一阶段
+
+#### 当前定位
+
+按你给的 Treasure Map 来看，这个项目已经不再是纯 `Level 1: Structured Agent`。
+
+更准确的定位是：
+
+- `Level 2: Agent Runtime` 已经基本成型
+- 并且已经踩进了一部分 `Level 3: Self-Healing Agent`
+
+原因很直接：
+
+| 能力 | 当前状态 | 说明 |
+|------|----------|------|
+| DAG Plan | `已实现` | `Plan` 在构建时做循环依赖检测 |
+| Typed Dataflow | `部分实现` | 有 `output_schema + input_bindings`，但还没有独立 `Edge` |
+| Strict State Machine | `已实现` | 有明确迁移表和非法迁移异常 |
+| Runtime vs LLM 解耦 | `已实现` | LLM 只参与局部 Replan，不掌控调度 |
+| Deterministic Replay | `部分实现` | `PlanSnapshot + DebugReplay` 已具备，但还不是字节级完整复演 |
+| Local Replan | `已实现` | 失败后可走 fallback / replan |
+| Failure Attribution | `基础版` | 已区分 `TIMEOUT / TOOL_FAILED / TOOL_ERROR`，但还没有统一归因体系 |
+| Dynamic Tool Selection | `基础版` | LLM 可在 Replan 中建议新 fallback 工具，但还没有 tool capability 层 |
+
+结论：当前最重要的不是立刻冲 Multi-Agent，而是把 `Level 2` 的最后那层“系统感”补齐。
+
+#### 下一阶段：补齐 Level 2（最优先）
+
+下一阶段建议只做这 4 件事，不要分心：
+
+1. **显式 `Edge` 模型**
+   把 `dependencies + input_bindings` 编译成真正的数据流边，支持 `from_step / to_step / data_mapping`。
+
+2. **完整 Schema System**
+   给 `Step` 增加 `input_schema`，再补一个 tool contract registry。
+   这样 fallback / replan 后才能做真正的 schema compatibility check。
+
+3. **更强的 Deterministic Replay**
+   除了 `plan snapshot`，还要持久化：
+   `resolved params`、`action metadata`、`tool outcome envelope`、`policy decision reason`。
+
+4. **稳定的 Runtime API**
+   把“demo 脚本拼装组件”收敛成明确入口：
+   `RuntimeConfig / create_runtime() / submit_task()`。
+
+这一阶段做完，你的项目才会彻底从“好看的原型”跨到“工业味很强的 Agent Runtime”。
+
+#### 再下一阶段：冲击 Level 3
+
+当 Level 2 补齐后，再进入下面这些能力：
+
+1. **Failure Attribution**
+   给失败建立统一分类：
+   `tool_error / timeout / policy_violation / schema_mismatch / llm_invalid_output / bad_plan`
+
+2. **约束下的 Dynamic Tool Selection**
+   不是让 LLM 随便选工具，而是基于 whitelist / capability / schema contract 约束选择。
+
+3. **Memory**
+   先做 `working_memory`，再做 `episodic_memory`。
+
+4. **Agent Runtime Design Doc**
+   这是杀招。
+   当 runtime 真补齐后，写一份设计文档会显著放大项目价值。
 
 ### C++ 重构优先级（后续阶段）
 
@@ -807,17 +935,19 @@ CheckpointManager: 保存 DONE Snapshot
 ## 快速开始
 
 ```bash
-# 安装依赖
-pip install -r requirements.txt
+# 安装最小依赖
+pip install pytest openai
 
-# 运行单 Agent 示例
+# 运行单 Agent 示例（默认使用 MockLLM）
 python examples/single_agent_demo.py
 
-# 运行测试套件
-pytest tests/ -v
+# 运行真实 DeepSeek Replan 示例
+export MYAGENT_LLM_PROVIDER=deepseek
+export DEEPSEEK_API_KEY=your_api_key
+python examples/deepseek_replan_demo.py
 
-# 运行压力测试
-python tests/stress_test.py --agents 10 --fail-rate 0.3
+# 运行测试套件
+pytest -q
 ```
 
 ---
@@ -830,18 +960,22 @@ agent_runtime/
 │   ├── agent.py              # Agent 数据结构
 │   ├── state_machine.py      # 状态机
 │   ├── plan.py               # Plan / Step / FallbackOption
-│   └── budget.py             # ExecutionBudget / BudgetUsage
+│   ├── budget.py             # ExecutionBudget / BudgetUsage
+│   └── test_core.py          # 核心数据模型 + 状态机测试
 ├── scheduler/
 │   ├── scheduler.py          # Scheduler 主循环
 │   └── policy_engine.py      # PolicyEngine
 ├── execution/
 │   ├── step_runner.py        # StepRunner
 │   ├── tool_executor.py      # ToolExecutor（异步）
-│   └── llm_interface.py      # LLM 抽象接口 + Mock 实现
+│   ├── llm_interface.py      # LLM 抽象接口 + Mock 实现
+│   ├── llm_deepseek.py       # DeepSeek 实现
+│   └── llm_factory.py        # 运行时 Provider 选择
 ├── events/
 │   ├── event_queue.py        # PriorityEventQueue
 │   ├── raw_event_bus.py      # RawEventBus + Dispatcher
-│   └── event_types.py        # EventType 枚举
+│   ├── event_types.py        # EventType 枚举
+│   └── test_event_system.py  # 事件系统测试
 ├── state/
 │   ├── state_manager.py      # StateManager
 │   └── dependency_validator.py # DependencyValidator
@@ -849,19 +983,16 @@ agent_runtime/
 │   ├── checkpoint_manager.py # CheckpointManager
 │   └── replay.py             # Debug / Recovery Replay
 ├── examples/
-│   └── single_agent_demo.py  # 快速演示
+│   ├── single_agent_demo.py  # 单 Agent 快速演示
+│   └── deepseek_replan_demo.py # 真实 DeepSeek Replan 演示
 └── tests/
-    ├── test_state_machine.py
-    ├── test_event_queue.py
     ├── test_tool_executor.py
     ├── test_step_runner.py
-    ├── test_dependency_validator.py
-    ├── test_policy_engine.py
+    ├── test_day6.py          # Scheduler / StateManager / DependencyValidator / PolicyEngine
     ├── test_checkpoint.py
-    ├── test_integration.py   # 端到端集成测试
-    └── stress_test.py        # 压力测试
+    └── test_llm_deepseek.py
 ```
 
 ---
 
-*本文档随开发进度持续更新。当前版本对应 Phase 1 设计阶段。*
+*本文档随开发进度持续更新。当前版本对应：Level 2 Agent Runtime（单 Agent 主链路完成） + Level 3 起步。*
