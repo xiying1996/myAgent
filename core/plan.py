@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
@@ -157,7 +158,16 @@ class Plan:
         拓扑排序检测循环依赖。
         复杂度 O(V+E)，V=步骤数，E=依赖边数。
         """
-        id_set = {s.step_id for s in self.steps}
+        step_ids = [s.step_id for s in self.steps]
+        id_set = set(step_ids)
+        if len(id_set) != len(step_ids):
+            duplicates = sorted(
+                sid for sid, count in Counter(step_ids).items() if count > 1
+            )
+            raise ValueError(
+                f"Plan.steps 存在重复 step_id: {duplicates}"
+            )
+
         for step in self.steps:
             for dep in step.dependencies:
                 if dep not in id_set:

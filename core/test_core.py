@@ -24,6 +24,8 @@ from core.state_machine import (
     AgentState, RetryMode, StateMachine, InvalidTransitionError
 )
 from core.agent import Agent, HistoryEntry
+from events.event import Event
+from events.event_types import EventPriority, EventType
 
 
 # ===========================================================================
@@ -155,6 +157,13 @@ class TestPlan:
                 Step("s0", "a", {}, dependencies=["nonexistent"]),
             ])
 
+    def test_duplicate_step_id_raises(self):
+        with pytest.raises(ValueError, match="重复 step_id"):
+            Plan(plan_id="p", steps=[
+                Step("s0", "a", {}),
+                Step("s0", "b", {}),
+            ])
+
     def test_completed_step_ids_frozen(self):
         plan = self._make_plan()
         plan.advance()
@@ -266,6 +275,75 @@ class TestExecutionBudget:
 
 
 # ===========================================================================
+# events/event.py 测试
+# ===========================================================================
+
+class TestEvent:
+    def test_timeout_defaults_to_high_priority(self):
+        event = Event.create(
+            agent_id="agent_001",
+            event_type=EventType.TIMEOUT,
+            payload={"step_id": "s0"},
+        )
+        assert event.priority == EventPriority.HIGH
+        assert event.is_high_priority is True
+
+    def test_tool_result_defaults_to_normal_priority(self):
+        event = Event.create(
+            agent_id="agent_001",
+            event_type=EventType.TOOL_RESULT,
+            payload={"step_id": "s0", "result": {"ok": True}},
+        )
+        assert event.priority == EventPriority.NORMAL
+        assert event.is_high_priority is False
+
+    def test_priority_mismatch_raises(self):
+        with pytest.raises(ValueError, match="优先级与类型不匹配"):
+            Event.create(
+                agent_id="agent_001",
+                event_type=EventType.TIMEOUT,
+                payload={},
+                priority=EventPriority.NORMAL,
+            )
+
+    def test_empty_agent_id_raises(self):
+        with pytest.raises(ValueError, match="agent_id"):
+            Event.create(
+                agent_id="",
+                event_type=EventType.TOOL_RESULT,
+                payload={},
+            )
+
+    def test_payload_is_copied_defensively(self):
+        payload = {"step_id": "s0"}
+        event = Event.create(
+            agent_id="agent_001",
+            event_type=EventType.TOOL_RESULT,
+            payload=payload,
+        )
+        payload["step_id"] = "mutated"
+        assert event.payload["step_id"] == "s0"
+
+    def test_to_dict_serializes_enum_values(self):
+        event = Event.create(
+            agent_id="agent_001",
+            event_type=EventType.ERROR,
+            payload={"reason": "tool crash"},
+            event_id="evt_fixed",
+            timestamp=123.45,
+        )
+        assert event.to_dict() == {
+            "event_id": "evt_fixed",
+            "agent_id": "agent_001",
+            "event_type": "ERROR",
+            "payload": {"reason": "tool crash"},
+            "timestamp": 123.45,
+            "priority": "high",
+            "is_plan_snapshot": False,
+        }
+
+
+# ===========================================================================
 # state_machine.py 测试
 # ===========================================================================
 
@@ -317,6 +395,22 @@ class TestStateMachine:
         sm.transition(AgentState.RETRYING, "fail", retry_mode=RetryMode.FALLBACK_MODE)
         sm.transition(AgentState.WAITING, "fallback submitted")
         assert sm.retry_mode is None
+
+    def test_switch_retry_mode_within_retrying(self):
+        sm = self._make_sm()
+        sm.transition(AgentState.RUNNING, "start")
+        sm.transition(AgentState.WAITING, "submitted")
+        sm.transition(AgentState.RETRYING, "fail", retry_mode=RetryMode.FALLBACK_MODE)
+        record = sm.switch_retry_mode(RetryMode.REPLAN_MODE, "fallback exhausted")
+        assert sm.state == AgentState.RETRYING
+        assert sm.retry_mode == RetryMode.REPLAN_MODE
+        assert record.from_state == AgentState.RETRYING
+        assert record.to_state == AgentState.RETRYING
+
+    def test_switch_retry_mode_outside_retrying_raises(self):
+        sm = self._make_sm()
+        with pytest.raises(InvalidTransitionError):
+            sm.switch_retry_mode(RetryMode.REPLAN_MODE, "invalid")
 
     # 非法迁移
     def test_invalid_ready_to_waiting_raises(self):

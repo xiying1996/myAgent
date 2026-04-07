@@ -154,6 +154,21 @@ class Agent:
         """非抛异常版本的合法性检查，Scheduler 分支判断用。"""
         return self._sm.can_transition(to)
 
+    def switch_retry_mode(
+        self,
+        retry_mode: RetryMode,
+        reason: str,
+    ) -> TransitionRecord:
+        """
+        在保持 RETRYING 状态不变的前提下切换其子模式。
+        由 Scheduler 在 fallback 链耗尽后进入 replan_mode 时调用。
+        """
+        record = self._sm.switch_retry_mode(retry_mode, reason)
+        self._history.append(
+            HistoryEntry.create("state_change", record.to_dict())
+        )
+        return record
+
     # ── Plan 委托 ──────────────────────────────────────────────────────────
 
     def current_step(self) -> Optional[Step]:

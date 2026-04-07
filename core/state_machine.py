@@ -219,8 +219,45 @@ class StateMachine:
         """
         if self._state in (AgentState.DONE, AgentState.ERROR):
             return to == AgentState.ERROR   # 终态唯一例外：允许再次 → ERROR（幂等）
+        if to == AgentState.ERROR:
+            return True   # 任意非终态都允许 → ERROR
         allowed = VALID_TRANSITIONS.get(self._state, frozenset())
         return to in allowed
+
+    def switch_retry_mode(
+        self,
+        retry_mode: RetryMode,
+        reason: str,
+    ) -> TransitionRecord:
+        """
+        在保持 RETRYING 状态不变的前提下切换其子模式。
+
+        典型场景：
+          FALLBACK_MODE → REPLAN_MODE
+
+        这不是普通状态迁移，因此不走 VALID_TRANSITIONS。
+        但仍然会写入一条 TransitionRecord，方便审计与回放。
+        """
+        if self._state != AgentState.RETRYING:
+            raise InvalidTransitionError(
+                self._agent_id,
+                self._state,
+                AgentState.RETRYING,
+                reason="只有 RETRYING 状态下才能切换 retry_mode",
+            )
+
+        from_state = self._state
+        self._retry_mode = retry_mode
+
+        record = TransitionRecord.create(
+            agent_id=self._agent_id,
+            from_state=from_state,
+            to_state=AgentState.RETRYING,
+            reason=reason,
+            retry_mode=retry_mode,
+        )
+        self._history.append(record)
+        return record
 
     # ── 查询接口 ──────────────────────────────────────────────────────────
 
