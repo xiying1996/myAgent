@@ -37,6 +37,9 @@ from scheduler.policy_engine import PolicyEngine
 from state.dependency_validator import DependencyValidator
 from state.state_manager import StateManager
 from scheduler.scheduler import Scheduler
+from tools.registry import ToolRegistry
+from tools.schema import Schema
+from tools.tool import Tool
 
 
 # ===========================================================================
@@ -454,6 +457,104 @@ class TestScheduler:
         sched._process_event(evt)
         agent = sm.get_agent(agent_id)
         assert agent.state == AgentState.ERROR
+
+    def test_retrying_fallback_skips_typed_tool_with_broken_output_schema(self):
+        class BadFallbackTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="bad_fallback",
+                    description="",
+                    input_schema=Schema.from_dict({}),
+                    output_schema=Schema.from_dict({"html": "str"}),
+                    timeout_s=11.0,
+                )
+
+            def _do_invoke(self, params):
+                return {"html": "<html></html>"}
+
+        class GoodFallbackTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="good_fallback",
+                    description="",
+                    input_schema=Schema.from_dict({}),
+                    output_schema=Schema.from_dict({"url": "str"}),
+                    timeout_s=6.5,
+                )
+
+            def _do_invoke(self, params):
+                return {"url": "http://example.com"}
+
+        queue = PriorityEventQueue()
+        bus = RawEventBus()
+        Dispatcher(queue).attach(bus)
+        sm = StateManager()
+        dv = DependencyValidator()
+        reg = ToolRegistry()
+        reg.register(BadFallbackTool())
+        reg.register(GoodFallbackTool())
+        sched = Scheduler(
+            event_queue=queue,
+            raw_event_bus=bus,
+            state_manager=sm,
+            step_runner=StepRunner(
+                MockLLM(simulate_delay_s=0),
+                tool_registry=reg,
+                dependency_validator=dv,
+            ),
+            dependency_validator=dv,
+            policy_engine=PolicyEngine(),
+        )
+        dummy = self._DummyExecutor()
+        sched.set_tool_executor(dummy)
+
+        plan = Plan.create([
+            Step(
+                "s0",
+                "search",
+                {"q": "x"},
+                output_schema={"seed": "str"},
+            ),
+            Step(
+                "s1",
+                "primary_fetch",
+                {"seed": ""},
+                fallback_chain=[
+                    FallbackOption("bad_fallback", {"seed": "x"}),
+                    FallbackOption("good_fallback", {"seed": "x"}),
+                ],
+                output_schema={"url": "str"},
+                input_bindings={"seed": "s0.seed"},
+                dependencies=["s0"],
+            ),
+            Step(
+                "s2",
+                "consume",
+                {"url": ""},
+                input_bindings={"url": "s1.url"},
+                dependencies=["s1"],
+            ),
+        ])
+        agent = Agent.create(plan=plan, agent_id="a_typed_fallback")
+        agent.plan._current_index = 1
+        sm.add_agent(agent)
+        dv.register_plan(plan)
+        sched._completed_outputs[agent.agent_id] = {"s0": {"seed": "hello"}}
+
+        agent.transition(AgentState.RUNNING, "start")
+        agent.transition(AgentState.WAITING, "submitted")
+        agent.transition(AgentState.RETRYING, "failed", retry_mode=RetryMode.FALLBACK_MODE)
+
+        sched._handle_retrying(agent, Event.create(
+            agent_id=agent.agent_id,
+            event_type=EventType.TOOL_FAILED,
+            payload={"step_id": "s1", "reason": "boom"},
+        ))
+
+        assert len(dummy.submitted) == 1
+        assert dummy.submitted[0].tool_name == "good_fallback"
+        assert dummy.submitted[0].timeout_s == 6.5
+        assert dummy.submitted[0].params["seed"] == "hello"
 
 
 # ===========================================================================

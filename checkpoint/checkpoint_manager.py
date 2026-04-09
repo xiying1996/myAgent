@@ -77,6 +77,7 @@ def serialize_plan_for_snapshot(plan: Plan) -> dict:
                     for fb in step.fallback_chain
                 ],
                 "output_schema": dict(step.output_schema),
+                "input_schema": dict(step.input_schema),
                 "input_bindings": dict(step.input_bindings),
                 "dependencies": list(step.dependencies),
                 "fallback_index": step._fallback_index,
@@ -99,6 +100,7 @@ def deserialize_plan_from_snapshot(data: dict) -> Plan:
                 for fb in step_data.get("fallback_chain", [])
             ],
             output_schema=dict(step_data.get("output_schema", {})),
+            input_schema=dict(step_data.get("input_schema", {})),
             input_bindings=dict(step_data.get("input_bindings", {})),
             dependencies=list(step_data.get("dependencies", [])),
         )

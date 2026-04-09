@@ -28,6 +28,10 @@ from execution.step_runner import (
     FailureRecord, NoFallbackAvailableError, ReplanFailedError,
     ReplanValidationResult, StepRunner
 )
+from state.dependency_validator import DependencyValidator
+from tools.registry import ToolRegistry
+from tools.schema import Schema
+from tools.tool import Tool
 
 
 # ===========================================================================
@@ -41,7 +45,7 @@ class TestMockLLM:
             agent_id="a1",
             failed_step=StepSnapshot(
                 step_id="s0", tool_name="web_search", params={"q": "x"},
-                output_schema={}, input_bindings={}, dependencies=[],
+                output_schema={}, input_schema={}, input_bindings={}, dependencies=[],
                 fallback_tools=["bing"],
             ),
             failure_reason="timeout",
@@ -61,7 +65,7 @@ class TestMockLLM:
             agent_id="a1",
             failed_step=StepSnapshot(
                 step_id="s0", tool_name="x", params={},
-                output_schema={}, input_bindings={}, dependencies=[],
+                output_schema={}, input_schema={}, input_bindings={}, dependencies=[],
                 fallback_tools=[],
             ),
             failure_reason="err",
@@ -80,7 +84,7 @@ class TestMockLLM:
             agent_id="a1",
             failed_step=StepSnapshot(
                 step_id="s0", tool_name="x", params={},
-                output_schema={}, input_bindings={}, dependencies=[],
+                output_schema={}, input_schema={}, input_bindings={}, dependencies=[],
                 fallback_tools=[],
             ),
             failure_reason="err",
@@ -186,6 +190,48 @@ class TestValidateReplan:
         v = sr.validate_replan(result, frozenset({"s0"}), "s1", ["s0", "s1", "s2"])
         assert v.ok is True
 
+    def test_R7_unregistered_fallback_rejected_when_registry_enabled(self):
+        llm = MockLLM()
+        reg = ToolRegistry()
+        sr = StepRunner(llm, tool_registry=reg, dependency_validator=DependencyValidator())
+        plan = Plan.create([Step("s0", "primary", {}, output_schema={"url": "str"})])
+        result = self._make_result(new_fallbacks=[FallbackSuggestion(tool="missing_tool", params={})])
+
+        v = sr.validate_replan(result, frozenset(), "s0", ["s0"], plan=plan)
+
+        assert v.ok is False
+        assert any("R7" in reason for reason in v.reasons)
+
+    def test_R8_incompatible_fallback_output_rejected(self):
+        class HtmlOnlyTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="html_only",
+                    description="",
+                    input_schema=Schema.from_dict({}),
+                    output_schema=Schema.from_dict({"html": "str"}),
+                )
+
+            def _do_invoke(self, params):
+                return {"html": "<html></html>"}
+
+        llm = MockLLM()
+        reg = ToolRegistry()
+        reg.register(HtmlOnlyTool())
+        dv = DependencyValidator()
+        sr = StepRunner(llm, tool_registry=reg, dependency_validator=dv)
+        plan = Plan.create([
+            Step("s0", "primary", {}, output_schema={"url": "str"}),
+            Step("s1", "fetch", {"url": ""}, input_bindings={"url": "s0.url"}, dependencies=["s0"]),
+        ])
+        dv.register_plan(plan)
+        result = self._make_result(new_fallbacks=[FallbackSuggestion(tool="html_only", params={})])
+
+        v = sr.validate_replan(result, frozenset(), "s0", ["s0", "s1"], plan=plan)
+
+        assert v.ok is False
+        assert any("R8" in reason for reason in v.reasons)
+
 
 # ===========================================================================
 # StepRunner.decide() 测试
@@ -256,6 +302,65 @@ class TestDecide:
         # MockLLM 返回 web_search_v2
         assert action.tool_name == "primary_v2"
         assert llm.call_count == 1
+
+    def test_fallback_mode_skips_unregistered_and_incompatible_tools(self):
+        class BadFallbackTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="bad_fallback",
+                    description="",
+                    input_schema=Schema.from_dict({}),
+                    output_schema=Schema.from_dict({"html": "str"}),
+                    timeout_s=9.0,
+                )
+
+            def _do_invoke(self, params):
+                return {"html": "<html></html>"}
+
+        class GoodFallbackTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="good_fallback",
+                    description="",
+                    input_schema=Schema.from_dict({}),
+                    output_schema=Schema.from_dict({"url": "str"}),
+                    timeout_s=7.0,
+                )
+
+            def _do_invoke(self, params):
+                return {"url": "http://example.com"}
+
+        reg = ToolRegistry()
+        reg.register(BadFallbackTool())
+        reg.register(GoodFallbackTool())
+        dv = DependencyValidator()
+
+        plan = Plan.create([
+            Step(
+                "s0",
+                "primary",
+                {},
+                fallback_chain=[
+                    FallbackOption("missing_tool", {}),
+                    FallbackOption("bad_fallback", {}),
+                    FallbackOption("good_fallback", {}),
+                ],
+                output_schema={"url": "str"},
+            ),
+            Step("s1", "fetch", {"url": ""}, input_bindings={"url": "s0.url"}, dependencies=["s0"]),
+        ])
+        dv.register_plan(plan)
+        agent = Agent.create(plan=plan)
+        agent.transition(AgentState.RUNNING, "test")
+        agent.transition(AgentState.WAITING, "test")
+        agent.transition(AgentState.RETRYING, "test", retry_mode=RetryMode.FALLBACK_MODE)
+
+        sr = StepRunner(MockLLM(), tool_registry=reg, dependency_validator=dv)
+        action = sr.decide(agent)
+
+        assert action is not None
+        assert action.tool_name == "good_fallback"
+        assert action.timeout_s == 7.0
 
 
 # ===========================================================================

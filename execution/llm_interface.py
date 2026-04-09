@@ -43,6 +43,7 @@ class StepSnapshot:
     tool_name:      str
     params:         Dict[str, Any]
     output_schema:  Dict[str, str]
+    input_schema:   Dict[str, str]
     input_bindings: Dict[str, str]
     dependencies:   List[str]
     fallback_tools: List[str]          # 当前 fallback chain 里的工具名列表

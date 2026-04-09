@@ -132,10 +132,14 @@ class DependencyValidator:
         真实场景需要从 ReplanResult 传入新工具的 output_schema。
         """
         problems: List[str] = []
-        schemas = self._schemas.setdefault(
+        registered_schemas = self._schemas.setdefault(
             plan.plan_id,
             {step.step_id: dict(step.output_schema) for step in plan.steps},
         )
+        schemas = {
+            sid: dict(schema)
+            for sid, schema in registered_schemas.items()
+        }
 
         # 构建 step_id → Step 的 map
         step_map: Dict[str, Step] = {s.step_id: s for s in plan.steps}
@@ -234,10 +238,6 @@ class DependencyValidator:
         Step 成功后，把输出保存到 completed_outputs（供下游 resolve_bindings 使用）。
         """
         completed_outputs[step_id] = output
-        # 同时更新 schema（记录实际输出的字段）
-        if step_id in self._schemas:
-            # output 的 key 应该在 schema 范围内，允许 output 是 schema 的子集
-            pass
         logger.debug(
             "DependencyValidator: step %s 输出已传播: %s",
             step_id, list(output.keys()),

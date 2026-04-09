@@ -56,6 +56,7 @@ class Step:
       tool_name      — 主工具名（先尝试这个）
       params         — 主工具参数
       fallback_chain — 备选工具列表，按顺序尝试
+      input_schema   — 输入字段类型声明，描述 step 期望接收的输入格式
       output_schema  — 输出字段类型声明，{"url": "str", "title": "str"}
       input_bindings — 输入来源，{"param_name": "step_id.field"}
       dependencies   — 依赖的 step_id 列表（用于 DAG 检测）
@@ -64,6 +65,7 @@ class Step:
     tool_name: str
     params: Dict[str, Any]
     fallback_chain: List[FallbackOption] = field(default_factory=list)
+    input_schema: Dict[str, str] = field(default_factory=dict)
     output_schema: Dict[str, str] = field(default_factory=dict)
     input_bindings: Dict[str, str] = field(default_factory=dict)
     dependencies: List[str] = field(default_factory=list)
@@ -110,6 +112,17 @@ class Step:
     def exhausted(self) -> bool:
         """主工具失败 且 Fallback 全部耗尽。"""
         return self._failed and not self.has_fallback()
+
+    def get_input_schema(self) -> "Schema":
+        """返回 input_schema 对应的 Schema 对象。"""
+        from tools.schema import Schema
+        return Schema.from_dict(self.input_schema)
+
+    @property
+    def typed_output_schema(self) -> "Schema":
+        """返回 output_schema 对应的 Schema 对象。"""
+        from tools.schema import Schema
+        return Schema.from_dict(self.output_schema)
 
     def current_tool(self) -> tuple[str, Dict[str, Any]]:
         """

@@ -24,6 +24,9 @@ from events.event_types import EventType, EventPriority
 from events.event import Event
 from execution.tool_executor import ToolExecutor, Action
 from execution.llm_interface import ToolExecutionFailed, ToolTimeoutError
+from tools.result import ToolErrorType, ToolResult
+from tools.schema import Schema
+from tools.tool import RetryPolicy, Tool
 
 
 # ===========================================================================
@@ -222,6 +225,93 @@ class TestToolExecutor:
         assert evt.payload["timeout_s"] == 0.05
 
         executor.shutdown()
+
+    def test_submit_typed_tool_success(self):
+        class EchoTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="typed_echo",
+                    description="",
+                    input_schema=Schema.from_dict({"message": "str"}),
+                    output_schema=Schema.from_dict({"echoed": "str"}),
+                )
+
+            def _do_invoke(self, params):
+                return {"echoed": params["message"]}
+
+        executor, q = self._make()
+        executor.register_tool(EchoTool())
+
+        executor.submit(Action(
+            tool_name="typed_echo",
+            params={"message": "hello"},
+            agent_id="a1",
+            step_id="s0",
+        ))
+
+        time.sleep(0.05)
+        evt = q.get_nowait()
+        assert evt.event_type == EventType.TOOL_RESULT
+        assert evt.payload["result"]["echoed"] == "hello"
+        assert evt.payload["tool_result"]["status"] == "SUCCESS"
+
+    def test_submit_typed_tool_timeout_emits_timeout(self):
+        class TimeoutTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="typed_timeout",
+                    description="",
+                    input_schema=Schema.from_dict({}),
+                    output_schema=Schema.from_dict({"ok": "bool"}),
+                    timeout_s=1.0,
+                )
+
+            def invoke(self, input_params, context=None):
+                return ToolResult.timeout(timeout_s=1.0, metadata={"source": "typed"})
+
+        executor, q = self._make()
+        executor.register_tool(TimeoutTool())
+
+        executor.submit(Action(
+            tool_name="typed_timeout",
+            params={},
+            agent_id="a1",
+            step_id="s0",
+        ))
+
+        time.sleep(0.05)
+        evt = q.get_nowait()
+        assert evt.event_type == EventType.TIMEOUT
+        assert evt.payload["timeout_s"] == 1.0
+        assert evt.payload["tool_result"]["status"] == "TIMEOUT"
+
+    def test_submit_typed_tool_schema_mismatch_emits_tool_failed(self):
+        class StrictTool(Tool):
+            def __init__(self):
+                super().__init__(
+                    name="typed_strict",
+                    description="",
+                    input_schema=Schema.from_dict({"x": "int"}),
+                    output_schema=Schema.from_dict({"y": "int"}),
+                )
+
+            def _do_invoke(self, params):
+                return {"y": params["x"] * 2}
+
+        executor, q = self._make()
+        executor.register_tool(StrictTool())
+
+        executor.submit(Action(
+            tool_name="typed_strict",
+            params={},
+            agent_id="a1",
+            step_id="s0",
+        ))
+
+        time.sleep(0.05)
+        evt = q.get_nowait()
+        assert evt.event_type == EventType.TOOL_FAILED
+        assert evt.payload["error_type"] == ToolErrorType.SCHEMA_MISMATCH.value
 
     def test_shutdown(self):
         executor, q = self._make()

@@ -53,6 +53,8 @@ from execution.tool_executor import Action
 from scheduler.policy_engine import PolicyEngine
 from state.dependency_validator import DependencyValidator
 from state.state_manager import StateManager
+from tools.adapter import AdapterRegistry
+from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,8 @@ class Scheduler:
         dependency_validator: DependencyValidator,
         policy_engine: Optional[PolicyEngine] = None,
         checkpoint_manager: Optional[CheckpointManager] = None,
+        tool_registry: Optional[ToolRegistry] = None,
+        adapter_registry: Optional[AdapterRegistry] = None,
     ) -> None:
         self._queue      = event_queue
         self._bus        = raw_event_bus
@@ -103,6 +107,8 @@ class Scheduler:
         self._dep_validator = dependency_validator
         self._policy     = policy_engine or PolicyEngine()
         self._checkpoint_mgr = checkpoint_manager
+        self._tool_registry = tool_registry
+        self._adapter_registry = adapter_registry
 
         self._running    = False
         self._thread: Optional[threading.Thread] = None
@@ -180,9 +186,56 @@ class Scheduler:
             self._process_event(event)
 
     def _process_event(self, event: Event) -> None:
-        """处理单个事件。"""
+        """
+        处理单个事件。
+
+        正确时序：
+          1. 先 get_agent()（不做状态变更）
+          2. 归一化（TOOL_RESULT 时）
+          3. 归一化成功 → on_event()（状态变更）
+          4. on_event() 成功 → completed_outputs 写入
+
+        设计取舍：
+          get_agent() + on_event() 拆分在单线程 scheduler 下安全。
+          StateManager 的 get_agent() 和 on_event() 各自有锁保护，
+          但两次调用之间理论上可能发生竞态。
+          当前方案允许在归一化和状态变更之间插入额外逻辑（如 budget 检查）。
+
+          若未来引入并发：
+          - 选项A：在 on_event() 内部做归一化（先状态变更，再归一化）
+          - 选项B：用单一锁保护 get_agent + normalize + on_event 全流程
+        """
         logger.debug("Scheduler: 处理 Event %s (agent=%s)", event.event_type, event.agent_id)
 
+        # 1. 取 Agent（不做状态变更）
+        agent = self._state_mgr.get_agent(event.agent_id)
+        if agent is None:
+            return
+
+        # ── 归一化（TOOL_RESULT 先归一化，再 on_event）──────
+        if event.event_type == EventType.TOOL_RESULT:
+            normalized = self._normalize_tool_result_event(agent, event)
+            if normalized is None:
+                # 归一化失败 → 同步处理 TOOL_FAILED（不通过 bus，避免双重处理）
+                failed_event = Event.create(
+                    agent_id=agent.agent_id,
+                    event_type=EventType.TOOL_FAILED,
+                    payload={
+                        "step_id": event.payload.get("step_id", ""),
+                        "tool_name": event.payload.get("tool_name", ""),
+                        "reason": "归一化失败",
+                    },
+                )
+                try:
+                    agent = self._state_mgr.on_event(failed_event)
+                except InvalidTransitionError:
+                    logger.warning("Scheduler: 归一化失败后 TOOL_FAILED 状态转换异常")
+                    return
+                # 不在此处引导 agent，由 _tick() 或下一轮事件循环处理 RETRYING
+                return
+            event = normalized  # 用归一化后的事件
+
+        # 2. 归一化成功 → on_event()（触发状态变更）
         try:
             agent = self._state_mgr.on_event(event)
         except InvalidTransitionError as e:
@@ -192,6 +245,7 @@ class Scheduler:
         if agent is None:
             return
 
+        # ── 归一化成功后才记录输出 ─────────────────────
         if event.event_type == EventType.TOOL_RESULT:
             self._record_completed_output(agent, event)
 
@@ -223,6 +277,88 @@ class Scheduler:
         for agent in self._state_mgr.list_agents():
             if agent.state == AgentState.READY and not agent.is_terminal():
                 self._dispatch_agent(agent)
+
+    # ── 归一化 ──────────────────────────────────────────────────────────
+
+    def _normalize_tool_result_event(
+        self, agent: Agent, event: Event
+    ) -> Optional[Event]:
+        """
+        TOOL_RESULT 归一化。
+
+        成功 → 返回 Event（payload 更新，event_id/timestamp/priority 保留）
+        失败 → 返回 None（由 _process_event() 调用方负责 emit TOOL_FAILED）
+
+        遵循 M1：normalize 不内部 emit，避免双重失败事件。
+        """
+        step_id = event.payload.get("step_id")
+        step = next((s for s in agent.plan.steps if s.step_id == step_id), None)
+        if step is None:
+            return event  # 找不到 step，不做归一化
+
+        result = event.payload.get("result", {})
+        if not isinstance(result, dict):
+            result = {"value": result}
+
+        # 1. 应用 adapter 链
+        adapter_names = event.payload.get("adapter_chain", [])
+        if adapter_names and self._adapter_registry is not None:
+            for name in adapter_names:
+                adapter = self._adapter_registry.get(name)
+                if adapter is None:
+                    logger.warning("AdapterRegistry: 找不到 adapter '%s'", name)
+                    return None
+                try:
+                    result = adapter.apply_checked(result)
+                except ValueError as e:
+                    logger.error(
+                        "Scheduler: step %s adapter '%s' 归一化失败: %s",
+                        step_id, name, e,
+                    )
+                    return None
+
+        # 2. 归一化后校验 step.output_schema + 应用 coercion（M1 修正）
+        output_schema = step.typed_output_schema
+        try:
+            result = output_schema.validate_and_coerce(result)
+        except ValueError as e:
+            logger.error(
+                "Scheduler: step %s 归一化后 output_schema 校验失败: %s",
+                step_id, e,
+            )
+            return None
+
+        # 3. 返回归一化后的事件（保留原 event_id/timestamp/priority）
+        normalized_payload = dict(event.payload)
+        normalized_payload["result"] = result
+        return Event(
+            event_id=event.event_id,
+            agent_id=event.agent_id,
+            event_type=event.event_type,
+            payload=normalized_payload,
+            timestamp=event.timestamp,
+            priority=event.priority,
+            is_plan_snapshot=event.is_plan_snapshot,
+        )
+
+    def _emit_tool_failed(
+        self,
+        agent: Agent,
+        step_id: str,
+        tool_name: str,
+        reason: str,
+    ) -> None:
+        """单一失败事件发射点（normalize 失败 + dispatch 失败共用）。"""
+        event = Event.create(
+            agent_id=agent.agent_id,
+            event_type=EventType.TOOL_FAILED,
+            payload={
+                "step_id":   step_id,
+                "tool_name": tool_name,
+                "reason":    reason,
+            },
+        )
+        self._bus.publish(event)
 
     def _引导_agent(self, agent: Agent, event: Event) -> None:
         """
@@ -273,13 +409,7 @@ class Scheduler:
             and agent.retry_mode == RetryMode.REPLAN_MODE
         )
 
-        # 状态转换：READY → RUNNING
-        if state == AgentState.READY and agent.can_transition(AgentState.RUNNING):
-            agent.transition(AgentState.RUNNING, reason="Scheduler 分配执行")
-        elif state == AgentState.READY:
-            return
-
-        # StepRunner 决定 Action
+        # StepRunner 决定 Action（先决定，再做校验 + 状态转换）
         try:
             action = self._step_runner.decide(agent)
         except NoFallbackAvailableError:
@@ -318,6 +448,69 @@ class Scheduler:
             step_id=action.step_id,
             timeout_s=action.timeout_s,
             metadata=dict(action.metadata),
+        )
+
+        # ── input_schema 校验 + coercion（READY→RUNNING 之前）──────────
+        if step.input_schema:
+            input_schema = step.get_input_schema()
+            try:
+                coerced_params = input_schema.validate_and_coerce(resolved_action.params)
+                # 用 coercion 后的值替换原参数（M2 修正）
+                resolved_action = Action(
+                    tool_name=resolved_action.tool_name,
+                    params=coerced_params,
+                    agent_id=resolved_action.agent_id,
+                    step_id=resolved_action.step_id,
+                    timeout_s=resolved_action.timeout_s,
+                    metadata=dict(resolved_action.metadata),
+                    adapter_chain=resolved_action.adapter_chain,
+                )
+            except ValueError as e:
+                logger.warning(
+                    "Scheduler: step %s input_schema 校验失败: %s",
+                    step.step_id, e,
+                )
+                agent.transition(AgentState.ERROR, reason=f"input_schema 校验失败: {e}")
+                return
+
+        # ── tool.output→step.output 可达性检查（READY→RUNNING 之前）────
+        adapter_names: List[str] = []
+        if self._adapter_registry is not None and self._tool_registry is not None:
+            tool = self._tool_registry.get(resolved_action.tool_name)
+            if tool is not None:
+                if not tool.output_schema.is_superset_of(step.typed_output_schema):
+                    path = self._adapter_registry.find_path(
+                        from_schema=tool.output_schema,
+                        to_schema=step.typed_output_schema,
+                    )
+                    if not path:
+                        logger.warning(
+                            "Scheduler: step %s tool '%s' output 无法归一化为 step output_schema",
+                            step.step_id, resolved_action.tool_name,
+                        )
+                        # 还在 READY/RETRYING 状态，直接转 ERROR（不占 budget）
+                        agent.transition(
+                            AgentState.ERROR,
+                            reason="tool output 无法归一化为 step output_schema（无 adapter 路径）",
+                        )
+                        return
+                    adapter_names = [a.name for a in path]
+
+        # ── 状态转换：READY → RUNNING（所有校验通过后才转换）────────────
+        if state == AgentState.READY and agent.can_transition(AgentState.RUNNING):
+            agent.transition(AgentState.RUNNING, reason="Scheduler 分配执行")
+        elif state == AgentState.READY:
+            return
+
+        # ── 重新构建 resolved_action，加上 adapter_chain ──────────────
+        resolved_action = Action(
+            tool_name=resolved_action.tool_name,
+            params=resolved_action.params,
+            agent_id=resolved_action.agent_id,
+            step_id=resolved_action.step_id,
+            timeout_s=resolved_action.timeout_s,
+            metadata=dict(resolved_action.metadata),
+            adapter_chain=adapter_names,
         )
 
         # 状态转换：READY 路径是 RUNNING → WAITING，RETRYING 路径是 RETRYING → WAITING

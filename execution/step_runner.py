@@ -70,6 +70,9 @@ from execution.llm_interface import (
     StepSnapshot,
 )
 from execution.tool_executor import Action
+from state.dependency_validator import DependencyValidator
+from tools.adapter import AdapterRegistry
+from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +165,17 @@ class StepRunner:
         # ToolExecutor 执行这个 Action
     """
 
-    def __init__(self, llm: LLMInterface) -> None:
+    def __init__(
+        self,
+        llm: LLMInterface,
+        tool_registry: Optional[ToolRegistry] = None,
+        dependency_validator: Optional[DependencyValidator] = None,
+        adapter_registry: Optional[AdapterRegistry] = None,
+    ) -> None:
         self._llm = llm
+        self._tool_registry = tool_registry
+        self._dep_validator = dependency_validator
+        self._adapter_registry = adapter_registry
 
     # ── 核心接口 ──────────────────────────────────────────────────────────
 
@@ -216,6 +228,7 @@ class StepRunner:
         completed_step_ids: frozenset,
         current_step_id: str,
         all_step_ids: List[str],
+        plan: Optional[Plan] = None,
     ) -> ReplanValidationResult:
         """
         系统强制校验 LLM 返回的修改建议。不依赖 LLM 自律。
@@ -254,6 +267,25 @@ class StepRunner:
             for forbidden_key in ("step_id", "tool_name"):
                 if forbidden_key in updates:
                     reasons.append(f"R6: step_param_updates['{sid}'] 不允许修改 '{forbidden_key}' 字段")
+
+        if self._tool_registry is not None:
+            for i, fb in enumerate(result.new_fallbacks):
+                tool = self._tool_registry.get(fb.tool)
+                if tool is None:
+                    reasons.append(f"R7: new_fallbacks[{i}].tool 未注册: '{fb.tool}'")
+                    continue
+
+                if plan is not None and self._dep_validator is not None:
+                    binding_validation = self._dep_validator.validate_replan(
+                        plan=plan,
+                        step_id=current_step_id,
+                        new_output_schema=tool.output_schema.to_simple_dict(),
+                    )
+                    if not binding_validation.ok:
+                        reasons.append(
+                            f"R8: new_fallbacks[{i}].tool '{fb.tool}' 输出与下游不兼容: "
+                            + " | ".join(binding_validation.problems)
+                        )
 
         if reasons:
             return ReplanValidationResult.failed(*reasons)
@@ -305,14 +337,19 @@ class StepRunner:
 
     def _decide_fallback(self, agent: Agent, step: Step) -> Action:
         """取 Fallback Chain 下一个工具，耗尽则抛 NoFallbackAvailableError。"""
-        fb = step.next_fallback()
+        fb = self._next_usable_fallback(agent.plan, step)
         if fb is None:
             raise NoFallbackAvailableError(agent.agent_id, step.step_id)
         logger.info(
             "[Agent:%s] Step[%s] 使用 Fallback: %s",
             agent.agent_id, step.step_id, fb.tool,
         )
-        return self._build_action(agent, fb.tool, fb.params)
+        return self._build_action(
+            agent,
+            fb.tool,
+            fb.params,
+            timeout_s=self._resolve_timeout(fb.tool),
+        )
 
     # ── 内部：路径 3（Replan）─────────────────────────────────────────────
 
@@ -358,6 +395,7 @@ class StepRunner:
             completed_step_ids = agent.plan.completed_step_ids,
             current_step_id = step.step_id,
             all_step_ids    = all_step_ids,
+            plan            = agent.plan,
         )
         if not validation.ok:
             raise ReplanFailedError(
@@ -376,15 +414,15 @@ class StepRunner:
         )
 
         # ── 取第一个新 Fallback 执行 ───────────────────────────────────────
-        new_fb = step.next_fallback()
+        new_fb = self._next_usable_fallback(agent.plan, step)
         if new_fb is None:
-            # 理论上不会到达（validate_replan 已保证 new_fallbacks 非空）
-            raise ReplanFailedError(agent.agent_id, "Replan 后 Fallback Chain 仍为空（bug）")
+            raise ReplanFailedError(agent.agent_id, "Replan 后没有可执行的兼容 Fallback")
 
         return self._build_action(
             agent,
             new_fb.tool,
             new_fb.params,
+            timeout_s=self._resolve_timeout(new_fb.tool),
             metadata={
                 "replan_trace": {
                     "provider": self._llm.provider_name,
@@ -450,9 +488,113 @@ class StepRunner:
             params       = params,
             agent_id     = agent.agent_id,
             step_id      = step.step_id,
-            timeout_s    = timeout_s,
+            timeout_s    = self._resolve_timeout(tool_name, timeout_s),
             metadata     = dict(metadata or {}),
         )
+
+    def _next_usable_fallback(
+        self,
+        plan: Plan,
+        step: Step,
+    ) -> Optional[FallbackOption]:
+        while True:
+            fb = step.next_fallback()
+            if fb is None:
+                return None
+
+            problems = self._fallback_problems(plan, step.step_id, fb.tool)
+            if not problems:
+                return fb
+
+            logger.warning(
+                "StepRunner: 跳过不可用 fallback %s for step %s: %s",
+                fb.tool,
+                step.step_id,
+                " | ".join(problems),
+            )
+
+    def _fallback_problems(
+        self,
+        plan: Plan,
+        current_step_id: str,
+        tool_name: str,
+    ) -> List[str]:
+        """返回空=可用；非空=拒绝理由。"""
+        if self._tool_registry is None:
+            return []
+
+        # 1. 未注册 → 拒绝
+        tool = self._tool_registry.get(tool_name)
+        if tool is None:
+            return [f"tool '{tool_name}' 未注册"]
+
+        # 2. 找 step
+        step = next((s for s in plan.steps if s.step_id == current_step_id), None)
+        if step is None:
+            return []
+
+        # 3. 参数兼容性：检查 step.params 能否被 fallback tool 接受
+        # step.params 是 step 运行时实际使用的参数（已通过 input_bindings 解析）
+        # validate_and_coerce 检查：必需字段是否存在、类型是否匹配、coercion
+        # 额外字段被保留（forward compatibility）
+        if tool.input_schema.fields:
+            try:
+                tool.input_schema.validate_and_coerce(step.params)
+            except ValueError as e:
+                return [
+                    f"tool '{tool_name}' 无法接受 step 的参数: {e}"
+                ]
+
+        # 4. output 可达性：先检查直接满足，再尝试 adapter 桥接
+        # 必须在 validate_replan 之前，因为 adapter 会改变 effective_output schema
+        #
+        # 注意：AdapterRegistry.find_path() 在 from_schema 是 to_schema 的 superset 时
+        # 返回空列表（不是错误）。所以这里用 "not is_superset_of" 作为是否需要 adapter
+        # 的判断条件，顺序至关重要。空列表在 "not is_superset_of" 分支内表示无适配路径。
+        effective_output = tool.output_schema
+        if not effective_output.is_superset_of(step.typed_output_schema):
+            if self._adapter_registry is not None:
+                path = self._adapter_registry.find_path(
+                    from_schema=tool.output_schema,
+                    to_schema=step.typed_output_schema,
+                )
+                if path:
+                    # adapter 桥接成功，用 adapter 最终 output 作为 effective_output
+                    effective_output = path[-1].output_schema
+                else:
+                    return [
+                        f"tool '{tool_name}' output_schema 无法归一化为 step output_schema"
+                        f"（无 adapter 路径）"
+                    ]
+            else:
+                return [
+                    f"tool '{tool_name}' output_schema 无法归一化为 step output_schema"
+                    f"（无 adapter 路径）"
+                ]
+
+        # 5. 依赖完整性校验（用 adapter 桥接后的 effective_output）
+        if self._dep_validator is not None:
+            validation = self._dep_validator.validate_replan(
+                plan=plan,
+                step_id=current_step_id,
+                new_output_schema=effective_output.to_simple_dict(),
+            )
+            if validation.problems:
+                return list(validation.problems)
+
+        return []
+
+    def _resolve_timeout(
+        self,
+        tool_name: str,
+        default_timeout_s: float = 30.0,
+    ) -> float:
+        if self._tool_registry is None:
+            return default_timeout_s
+        tool = self._tool_registry.get(tool_name)
+        if tool is None:
+            return default_timeout_s
+        return tool.timeout_s
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +608,7 @@ def _step_to_snapshot(step: Step) -> StepSnapshot:
         tool_name      = step.tool_name,
         params         = dict(step.params),
         output_schema  = dict(step.output_schema),
+        input_schema   = dict(step.input_schema),
         input_bindings = dict(step.input_bindings),
         dependencies   = list(step.dependencies),
         fallback_tools = [fb.tool for fb in step.fallback_chain],
