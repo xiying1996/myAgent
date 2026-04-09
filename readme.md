@@ -135,28 +135,74 @@
 ## 3. 分层设计
 
 ```
+Layer -1 │  Planner (预执行阶段)          Goal + ToolRegistry → Plan
+─────────┼─────────────────────────────────────────────────────────
 Layer 0  │  Task Submission API          对外入口，接收任务
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 1  │  Scheduler + PolicyEngine     调度与安全边界
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 2  │  Agent + StateMachine         Agent 持有状态机
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 3  │  StepRunner + LLM             决策层（局部 Replan）
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 4  │  DependencyValidator          依赖图检查与修复
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 5  │  ToolExecutor                 异步执行层
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 6  │  RawEventBus + EventQueue     事件路由层
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 7  │  StateManager                 状态持久层
-─────────┼────────────────────────────────────────────────
+─────────┼─────────────────────────────────────────────────────────
 Layer 8  │  CheckpointManager            可恢复层
 ```
 
 ---
 
 ## 4. 核心模块详解
+
+### 4.0 Planner（Layer -1，预执行阶段）
+
+Planner 是任务提交前的**预执行阶段**模块，负责将自然语言 Goal 转化为可执行的 Plan。
+
+**设计原则：**
+- Planner 生成的 Plan 必须符合现有 `Plan` 数据结构，确保与 Scheduler、DependencyValidator 无缝衔接
+- 不直接执行工具，仅生成 Plan 结构
+- 支持 ToolRegistry 查询可用工具能力
+
+**核心组件：**
+
+| 组件 | 职责 |
+|------|------|
+| Schema Registry | 工具契约注册中心，管理工具的 input_schema / output_schema / capability |
+| DAG Generator | 基于 LLM 动态生成 Step 拓扑图，处理数据流绑定 |
+| Plan Validator | 生成时验证（拓扑排序 + Schema 兼容性检查） |
+
+**接口设计：**
+
+```python
+class Planner:
+    """Goal → Plan 转换器"""
+    def __init__(self, tool_registry: ToolRegistry, llm: LLMInterface): ...
+    
+    def generate_plan(self, goal: str, constraints: PlanConstraints) -> Plan:
+        """
+        1. 查询 ToolRegistry 获取可用工具
+        2. LLM 生成 Step 序列 + 数据流绑定
+        3. Plan Validator 做拓扑校验
+        4. 返回合规 Plan
+        """
+
+@dataclass
+class PlanConstraints:
+    max_steps: int
+    allowed_tools: Optional[List[str]]
+    deadline: Optional[float]
+    budget: ExecutionBudget
+```
+
+**输出：** 符合 `Plan` 数据结构的执行计划，包含 Step 列表、依赖关系、input_bindings。
+
+---
 
 ### 4.1 Agent
 
@@ -810,7 +856,7 @@ CheckpointManager: 保存 DONE Snapshot
 
 ### Phase 4：多 Agent + 收尾（Day 12-15）
 
-状态：`进行中`
+状态：`待启动`
 
 | Day | 目标 | 当前结果 |
 |-----|------|---------|
@@ -818,6 +864,16 @@ CheckpointManager: 保存 DONE Snapshot
 | 13 | RETRYING 子状态细化 | `已完成`，`fallback_mode / replan_mode` 已落地 |
 | 14 | 压力测试 | `未完成`，尚无正式 stress harness |
 | 15 | 文档 + 接口整理 | `部分完成`，README 已更新，稳定对外 API 仍待整理 |
+
+### Phase 5：Planner + Schema Registry（Day 16-18）
+
+状态：`下一步`
+
+| Day | 目标 | 当前结果 |
+|-----|------|---------|
+| 16 | Schema Registry | `未完成`，需新建 `core/schema_registry.py`，管理工具契约 |
+| 17 | DAG Generator | `未完成`，基于 LLM 生成 Step 拓扑图，处理数据流绑定 |
+| 18 | Plan Validator | `未完成`，生成时拓扑排序 + Schema 兼容性检查 |
 
 ---
 
@@ -828,12 +884,15 @@ CheckpointManager: 保存 DONE Snapshot
 当前仓库已经形成一个可运行、可回放、可接真实 LLM 的单 Agent Runtime：
 
 - `Plan / Step` 已支持 DAG 校验、`dependencies`、`input_bindings`、`output_schema`
-- `StateMachine` 已严格落地，包含 `READY / RUNNING / WAITING / RETRYING / DONE / ERROR`
+- `StateMachine` 已严格落地，包含 `READY / RUNNING / WAITING / RETTRYING / DONE / ERROR`
 - `RetryMode` 已落地，支持 `fallback_mode / replan_mode`
 - `ToolExecutor`、`Scheduler`、`PolicyEngine`、`StateManager` 已闭环
 - `StepRunner` 已支持局部 Replan，且真实接入了 `DeepSeekLLM`
 - `CheckpointManager + DebugReplay + RecoveryReplay` 已落地
 - 成功 Replan 会把 `provider / model / raw_response / normalized_result` 写入 `PlanSnapshot`
+- `ToolRegistry` + `Tool` 抽象 + `Adapter` 转换链已完整落地
+- 内置工具：`WebSearchTool`（Shuyan/SerpAPI/DuckDuckGo）、`HttpFetchTool`、`BashTool`、`FileSystemTool`
+- `Schema` 系统支持类型校验、`AdapterRegistry` 支持 BFS 路径查找
 - 当前回归结果：`pytest -q` → `173 passed, 1 skipped`
 
 ### 当前版本限制（Python 原型）
@@ -955,13 +1014,12 @@ pytest -q
 ## 目录结构
 
 ```
-agent_runtime/
+MyAgent/
 ├── core/
 │   ├── agent.py              # Agent 数据结构
 │   ├── state_machine.py      # 状态机
 │   ├── plan.py               # Plan / Step / FallbackOption
-│   ├── budget.py             # ExecutionBudget / BudgetUsage
-│   └── test_core.py          # 核心数据模型 + 状态机测试
+│   └── budget.py             # ExecutionBudget / BudgetUsage
 ├── scheduler/
 │   ├── scheduler.py          # Scheduler 主循环
 │   └── policy_engine.py      # PolicyEngine
@@ -970,27 +1028,42 @@ agent_runtime/
 │   ├── tool_executor.py      # ToolExecutor（异步）
 │   ├── llm_interface.py      # LLM 抽象接口 + Mock 实现
 │   ├── llm_deepseek.py       # DeepSeek 实现
-│   └── llm_factory.py        # 运行时 Provider 选择
+│   └── llm_factory.py       # 运行时 Provider 选择
 ├── events/
 │   ├── event_queue.py        # PriorityEventQueue
-│   ├── raw_event_bus.py      # RawEventBus + Dispatcher
-│   ├── event_types.py        # EventType 枚举
-│   └── test_event_system.py  # 事件系统测试
+│   └── raw_event_bus.py      # RawEventBus + Dispatcher
 ├── state/
 │   ├── state_manager.py      # StateManager
 │   └── dependency_validator.py # DependencyValidator
 ├── checkpoint/
-│   ├── checkpoint_manager.py # CheckpointManager
-│   └── replay.py             # Debug / Recovery Replay
+│   └── checkpoint_manager.py # CheckpointManager + Replay
+├── tools/
+│   ├── tool.py               # Tool 抽象基类
+│   ├── schema.py             # Schema 定义
+│   ├── adapter.py            # Adapter 转换器
+│   ├── registry.py           # ToolRegistry 工具注册中心
+│   ├── result.py             # ToolResult 封装
+│   └── impl/                 # 内置工具实现
+│       ├── web_search.py     # WebSearch + HttpFetch
+│       ├── filesystem.py      # 文件系统工具
+│       └── bash.py           # Bash 执行工具
+├── planner/                  # Layer -1: 预执行阶段（待实现）
+│   ├── schema_registry.py    # 工具契约注册中心
+│   ├── dag_generator.py     # DAG 动态生成器
+│   └── plan_validator.py    # Plan 生成时验证器
 ├── examples/
 │   ├── single_agent_demo.py  # 单 Agent 快速演示
-│   └── deepseek_replan_demo.py # 真实 DeepSeek Replan 演示
+│   ├── deepseek_replan_demo.py # 真实 DeepSeek Replan 演示
+│   ├── research_pipeline_demo.py # 多步骤研究 Pipeline
+│   ├── file_processing_demo.py  # 文件处理 Pipeline
+│   └── parallel_agents_demo.py  # 多 Agent 并行演示
 └── tests/
     ├── test_tool_executor.py
     ├── test_step_runner.py
-    ├── test_day6.py          # Scheduler / StateManager / DependencyValidator / PolicyEngine
-    ├── test_checkpoint.py
-    └── test_llm_deepseek.py
+    ├── test_day6.py          # Scheduler / StateManager / DependencyValidator
+    ├── test_llm_deepseek.py
+    ├── test_e2e_tool_chain.py
+    └── test_tools.py
 ```
 
 ---
